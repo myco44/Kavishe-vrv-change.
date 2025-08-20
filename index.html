@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="sw">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Voice Lab — Record / Upload / Play with Presets (WebAudio)</title>
+  <style>
+    :root{--bg:#071026;--card:#0b2333;--text:#e7f6ff;--muted:#99b7cf;--accent:#39a7ff}
+    body{margin:0;font-family:system-ui,Segoe UI,Roboto; background:linear-gradient(180deg,var(--bg),#041224);color:var(--text);padding:18px}
+    h1{margin:0 0 8px;font-size:20px}
+    .grid{display:grid;grid-template-columns:1fr 420px;gap:14px}
+    .card{background:var(--card);border-radius:12px;padding:12px;border:1px solid rgba(255,255,255,0.03)}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+    button,select,input[type="range"],input[type="file"],textarea{padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:#072838;color:var(--text)}
+    button.primary{background:var(--accent);color:#042130;border:1px solid rgba(255,255,255,0.06)}
+    .small{font-size:13px;color:var(--muted)}
+    #wave{width:100%;height:80px;background:#021620;border-radius:8px}
+    .preset{padding:6px 8px;border-radius:8px;background:#082b3b;cursor:pointer;border:1px solid rgba(255,255,255,0.02)}
+    .preset.selected{outline:2px solid #2a9bff}
+    .log{width:100%;height:160px;border-radius:8px;background:#021018;color:#bfe9ff;padding:8px;overflow:auto;font-family:monospace;font-size:12px}
+    @media (max-width:980px){ .grid{grid-template-columns:1fr} }
+  </style>
+</head>
+<body>
+  <h1>Voice Lab — Rekodi / Pakia / Play + Presets (Browser)</h1>
+  <div class="grid">
+    <!-- Left: controls -->
+    <div class="card">
+      <div class="small">Suala muhimu: hii inatumia Web Audio API. Presets ni **approximation** (pitch + filters + FX). Kubadilisha sauti kabisa (lafudhi/kabila/mlevi kweli) kunahitaji model za AI / cloud APIs.</div>
+
+      <h3 style="margin-top:12px">1) Rekodi & Pakia</h3>
+      <div class="row">
+        <button id="startRec" class="primary">● Start Recording</button>
+        <button id="stopRec" disabled>⏹ Stop Recording</button>
+        <button id="playRaw" disabled>▶ Play Raw</button>
+        <button id="stopPlay" disabled>■ Stop</button>
+      </div>
+
+      <div class="row">
+        <input id="upload" type="file" accept="audio/*" />
+        <button id="useUpload" disabled>Use Uploaded</button>
+        <button id="saveWav" disabled>💾 Save Processed WAV</button>
+      </div>
+
+      <h3 style="margin-top:12px">2) Presets (tap to select)</h3>
+      <div id="presets" class="row" style="align-items:flex-start"></div>
+
+      <h3 style="margin-top:12px">3) Controls for chosen preset</h3>
+      <div class="row">
+        <label class="small">Pitch <input id="pitch" type="range" min="0.5" max="2.0" step="0.01" value="1.0"/></label>
+        <span id="pitchVal" class="small">1.00x</span>
+      </div>
+      <div class="row">
+        <label class="small">Formant/Color <input id="formant" type="range" min="-4" max="4" step="0.1" value="0"/></label>
+        <span id="formVal" class="small">0.0</span>
+      </div>
+      <div class="row">
+        <label class="small"><input id="fxReverb" type="checkbox"/> Reverb</label>
+        <label class="small"><input id="fxDist" type="checkbox"/> Distortion</label>
+        <label class="small"><input id="fxRobot" type="checkbox"/> Robotize</label>
+      </div>
+
+      <h3 style="margin-top:12px">4) Text → Speech (browser TTS)</h3>
+      <textarea id="ttsText" placeholder="Andika hapa (Kiswahili)..." rows="3" style="width:100%;"></textarea>
+      <div class="row">
+        <select id="ttsLang"><option value="sw-TZ">sw-TZ (Kiswahili)</option><option value="en-US">en-US</option><option value="en-GB">en-GB</option></select>
+        <button id="speak">🔈 Speak (TTS)</button>
+        <button id="speakFx" title="TTS with FX is limited">🔈 Speak + FX (limited)</button>
+      </div>
+
+      <h3 style="margin-top:12px">Notes</h3>
+      <div class="small">• Kama Play Raw/Play Preset hakuna sauti: bofya kwanza kitufe chochote (user gesture) ili AudioContext ichukuliwe.<br>
+      • TTS + FX: browsers hutumia SpeechSynthesis na hatuwezi daima ku-route output yake kupitia WebAudio (limitation). Ili TTS + FX vizuri, rekodi TTS au tumia server-side TTS.</div>
+    </div>
+
+    <!-- Right: visuals & logs -->
+    <div class="card">
+      <h3>Waveform & Log</h3>
+      <canvas id="wave"></canvas>
+      <h3 style="margin-top:12px">Selected preset:</h3>
+      <div id="selectedPreset" class="small">none</div>
+      <h3 style="margin-top:12px">Log</h3>
+      <div id="log" class="log"></div>
+    </div>
+  </div>
+
+<script>
+/* Voice Lab — functional implementation
+   - record via MediaRecorder
+   - upload audio file
+   - decode to AudioBuffer
+   - play with WebAudio effects (playbackRate for pitch, biquad filters for formant color,
+     convolver for reverb, waveshaper for distortion, simple ring-mod for robot)
+   - render processed output to WAV via OfflineAudioContext for saving
+*/
+
+// ---- UI refs
+const startRec = document.getElementById('startRec');
+const stopRec = document.getElementById('stopRec');
+const playRaw = document.getElementById('playRaw');
+const stopPlay = document.getElementById('stopPlay');
+const upload = document.getElementById('upload');
+const useUpload = document.getElementById('useUpload');
+const saveWav = document.getElementById('saveWav');
+const presetsDiv = document.getElementById('presets');
+const pitch = document.getElementById('pitch');
+const pitchVal = document.getElementById('pitchVal');
+const formant = document.getElementById('formant');
+const formVal = document.getElementById('formVal');
+const fxReverb = document.getElementById('fxReverb');
+const fxDist = document.getElementById('fxDist');
+const fxRobot = document.getElementById('fxRobot');
+const wave = document.getElementById('wave');
+const logEl = document.getElementById('log');
+const selectedPresetEl = document.getElementById('selectedPreset');
+
+const speakBtn = document.getElementById('speak');
+const speakFxBtn = document.getElementById('speakFx');
+const ttsText = document.getElementById('ttsText');
+const ttsLang = document.getElementById('ttsLang');
+
+// ---- state
+let mediaStream = null;
+let mediaRecorder = null;
+let recordedChunks = [];
+let rawAudioBuffer = null;         // AudioBuffer containing current audio (recorded or uploaded)
+let uploadedArrayBuffer = null;
+let audioCtx = null;
+let currentSource = null;
+let currentOsc = null;
+let currentConvolver = null;
+let selectedPresetIndex = 0;
+
+// ---- presets (approximations)
+const PRESETS = [
+  { id:'neutral', label:'Neutral', pitch:1.0, formant:0, reverb:false, distort:false, robot:false },
+  { id:'child_female', label:'Mtoto (Kike)', pitch:1.7, formant:2.2, reverb:false, distort:false, robot:false },
+  { id:'child_male', label:'Mtoto (Mvulana)', pitch:1.5, formant:1.6, reverb:false, distort:false, robot:false },
+  { id:'young_female', label:'Kike Mdogo', pitch:1.25, formant:1.0, reverb:false, distort:false, robot:false },
+  { id:'adult_male', label:'Mwanaume', pitch:0.92, formant:-0.7, reverb:false, distort:false, robot:false },
+  { id:'adult_female', label:'Mwanamke', pitch:1.02, formant:0.3, reverb:false, distort:false, robot:false },
+  { id:'old_male', label:'Mzee', pitch:0.70, formant:-2.0, reverb:true, distort:false, robot:false },
+  { id:'drunk', label:'Mlevi', pitch:0.85, formant:-1.0, reverb:true, distort:true, robot:false },
+  { id:'cartoon', label:'Cartoon', pitch:1.9, formant:3.0, reverb:false, distort:true, robot:false },
+  { id:'robot', label:'Robot', pitch:1.0, formant:-2.0, reverb:false, distort:true, robot:true }
+];
+
+// ---- utilities
+function log(msg){ logEl.textContent = new Date().toLocaleTimeString() + ' • ' + msg + '\n' + logEl.textContent; }
+function ensureAudioCtx(){
+  if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+function updatePresetUI(){
+  presetsDiv.innerHTML = '';
+  PRESETS.forEach((p, i)=>{
+    const b = document.createElement('div');
+    b.className = 'preset' + (i===selectedPresetIndex ? ' selected':'');
+    b.textContent = p.label;
+    b.title = p.id;
+    b.onclick = ()=> { selectedPresetIndex = i; applyPresetToControls(p); renderSelected(); };
+    presetsDiv.appendChild(b);
+  });
+  renderSelected();
+}
+function renderSelected(){
+  const p = PRESETS[selectedPresetIndex];
+  selectedPresetEl.textContent = `${p.label} — pitch ${p.pitch.toFixed(2)}x, formant ${p.formant.toFixed(1)}`;
+}
+function applyPresetToControls(p){
+  pitch.value = p.pitch; pitchVal.textContent = parseFloat(p.pitch).toFixed(2) + 'x';
+  formant.value = p.formant; formVal.textContent = parseFloat(p.formant).toFixed(1);
+  fxReverb.checked = !!p.reverb; fxDist.checked = !!p.distort; fxRobot.checked = !!p.robot;
+}
+
+// ---- recording
+startRec.onclick = async () => {
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+    mediaRecorder = new MediaRecorder(mediaStream);
+    recordedChunks = [];
+    mediaRecorder.ondataavailable = e => { if(e.data && e.data.size) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = async () => {
+      const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+      const arrayBuffer = await blob.arrayBuffer();
+      const ctx = ensureAudioCtx();
+      rawAudioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+      log('Recording complete — duration: ' + rawAudioBuffer.duration.toFixed(2) + 's');
+      drawWave(rawAudioBuffer);
+      playRaw.disabled = false;
+      saveWav.disabled = false;
+    };
+    mediaRecorder.start();
+    startRec.disabled = true; stopRec.disabled=false;
+    log('Recording started — speak now');
+  } catch (e) {
+    alert('Mic access required: ' + e.message);
+    log('record error: ' + e.message);
+  }
+};
+
+stopRec.onclick = () => {
+  if(mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+  startRec.disabled = false; stopRec.disabled=true;
+  log('Recording stopped');
+};
+
+// ---- upload handling
+upload.onchange = async (ev) => {
+  const f = ev.target.files[0];
+  if(!f) return;
+  uploadedArrayBuffer = await f.arrayBuffer();
+  const ctx = ensureAudioCtx();
+  try{
+    const buf = await ctx.decodeAudioData(uploadedArrayBuffer.slice(0));
+    rawAudioBuffer = buf;
+    log('Uploaded and decoded — ' + f.name + ' duration: ' + buf.duration.toFixed(2) + 's');
+    drawWave(rawAudioBuffer);
+    useUpload.disabled = false;
+    playRaw.disabled = false;
+    saveWav.disabled = false;
+  }catch(e){
+    alert('Could not decode uploaded audio: ' + e.message);
+    log('upload decode error: ' + e.message);
+  }
+};
+useUpload.onclick = ()=> { if(rawAudioBuffer) log('Using uploaded audio as current buffer'); };
+
+// ---- play raw (no effects)
+playRaw.onclick = async ()=> {
+  if(!rawAudioBuffer){ alert('Hakuna sauti (rekodi au upload kwanza)'); return; }
+  const ctx = ensureAudioCtx();
+  stopAllPlayback();
+  const src = ctx.createBufferSource();
+  src.buffer = rawAudioBuffer;
+  src.connect(ctx.destination);
+  src.start();
+  currentSource = src;
+  stopPlay.disabled = false;
+  log('Playing raw audio');
+  src.onended = ()=> { stopAllPlayback(); log('Raw play ended'); };
+};
+
+// ---- stop playback
+stopPlay.onclick = ()=> { stopAllPlayback(); log('Playback stopped by user'); };
+function stopAllPlayback(){
+  try{ currentSource?.stop(); }catch(e){}
+  try{ currentOsc?.stop?.(); }catch(e){}
+  currentSource = null; currentOsc = null;
+  stopPlay.disabled = true;
+}
+
+// ---- core: play with preset/effects
+function makeDistortionCurve(amount){
+  const k = typeof amount==='number'?amount:50;
+  const n = 44100; const curve = new Float32Array(n);
+  for(let i=0;i<n;i++){
+    const x = i*2/n - 1;
+    curve[i] = (3 + k) * x * 20 * Math.PI/180 / (Math.PI + k * Math.abs(x));
+  }
+  return curve;
+}
+
+async function playWithPreset(buffer, options){
+  if(!buffer){ alert('No audio to play'); return; }
+  const ctx = ensureAudioCtx();
+  stopAllPlayback();
+
+  // create graph
+  const src = ctx.createBufferSource();
+  src.buffer = buffer;
+  src.playbackRate.value = options.pitch || 1.0; // simple pitch (affects duration too)
+
+  // two filters to shape timbre (formant-like)
+  const lowShelf = ctx.createBiquadFilter(); lowShelf.type = 'lowshelf';
+  lowShelf.frequency.value = 300; lowShelf.gain.value = (options.formant || 0) * -3;
+
+  const highShelf = ctx.createBiquadFilter(); highShelf.type = 'highshelf';
+  highShelf.frequency.value = 3000; highShelf.gain.value = (options.formant || 0) * 2;
+
+  src.connect(lowShelf); lowShelf.connect(highShelf);
+
+  // bandpass/quality can emulate "narrow" voices
+  const band = ctx.createBiquadFilter(); band.type='bandpass'; band.frequency.value=800; band.Q.value = options.bandQ || 1;
+  highShelf.connect(band);
+
+  let last = band;
+
+  // distortion
+  if(options.distort){
+    const sh = ctx.createWaveShaper(); sh.curve = makeDistortionCurve(400); sh.oversample='4x';
+    last.connect(sh); last = sh;
+  }
+
+  // reverb (convolver)
+  if(options.reverb){
+    const conv = ctx.createConvolver();
+    conv.buffer = makeImpulse(ctx, 1.2, 2.0);
+    last.connect(conv); last = conv;
+    currentConvolver = conv;
+  }
+
+  // robotize (ring modulation)
+  if(options.robot){
+    const mod = ctx.createOscillator(); mod.type='square'; mod.frequency.value = options.robotFreq || 30;
+    const modGain = ctx.createGain(); modGain.gain.value = 0.5;
+    mod.connect(modGain);
+    // route audio through a GainNode whose gain is modulated by oscillator -> amplitude modulation
+    const modTarget = ctx.createGain(); modTarget.gain.value = 1.0;
+    last.connect(modTarget);
+    modGain.connect(modTarget.gain);
+    mod.start();
+    currentOsc = mod;
+    modTarget.connect(ctx.destination);
+    src.start();
+    currentSource = src;
+    stopPlay.disabled = false;
+    log('Playing with robot preset (approx)');
+    src.onended = ()=> { stopAllPlayback(); log('Preset play ended'); };
+    return;
+  }
+
+  // final connect
+  last.connect(ctx.destination);
+  src.start();
+  currentSource = src;
+  stopPlay.disabled = false;
+  log('Playing with preset');
+  src.onended = ()=> { stopAllPlayback(); log('Preset play ended'); };
+}
+
+// helper: impulse for reverb
+function makeImpulse(ctx, duration=1.5, decay=2.0){
+  const sr = ctx.sampleRate; const len = Math.floor(duration*sr);
+  const buf = ctx.createBuffer(2, len, sr);
+  for(let ch=0; ch<2; ch++){
+    const data = buf.getChannelData(ch);
+    for(let i=0;i<len;i++){
+      data[i] = (Math.random()*2-1) * Math.pow(1 - i/len, decay);
+    }
+  }
+  return buf;
+}
+
+// ---- Save processed WAV using OfflineAudioContext
+async function renderProcessedToWav(buffer, options){
+  // Estimate output length (pitch affects length)
+  const outLen = Math.ceil(buffer.length / (options.pitch || 1.0));
+  const offline = new OfflineAudioContext(buffer.numberOfChannels, outLen, buffer.sampleRate);
+
+  const src = offline.createBufferSource(); src.buffer = buffer;
+  src.playbackRate.value = options.pitch || 1.0;
+
+  const lowShelf = offline.createBiquadFilter(); lowShelf.type='lowshelf';
+  lowShelf.frequency.value=300; lowShelf.gain.value=(options.formant||0)*-3;
+  const highShelf = offline.createBiquadFilter(); highShelf.type='highshelf';
+  highShelf.frequency.value=3000; highShelf.gain.value=(options.formant||0)*2;
+  const band = offline.createBiquadFilter(); band.type='bandpass'; band.frequency.value=800; band.Q.value=options.bandQ||1;
+
+  src.connect(lowShelf); lowShelf.connect(highShelf); highShelf.connect(band);
+
+  let last = band;
+  if(options.distort){
+    const sh = offline.createWaveShaper(); sh.curve = makeDistortionCurve(400); sh.oversample='4x';
+    last.connect(sh); last = sh;
+  }
+  if(options.reverb){
+    const conv = offline.createConvolver(); conv.buffer = makeImpulse(offline, 1.2, 2.0);
+    last.connect(conv); last = conv;
+  }
+  last.connect(offline.destination);
+  src.start(0);
+  log('Rendering processed audio (this may take a moment)...');
+  const rendered = await offline.startRendering();
+
+  // convert to WAV Blob
+  const wavBlob = bufferToWavBlob(rendered);
+  return wavBlob;
+}
+
+// WAV conversion
+function bufferToWavBlob(abuf){
+  const numChan = abuf.numberOfChannels;
+  const len = abuf.length * numChan;
+  const buffer = new ArrayBuffer(44 + len * 2);
+  const view = new DataView(buffer);
+  function writeString(offset,str){ for(let i=0;i<str.length;i++) view.setUint8(offset+i,str.charCodeAt(i)); }
+  writeString(0,'RIFF'); view.setUint32(4,36 + len*2, true); writeString(8,'WAVE'); writeString(12,'fmt ');
+  view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,numChan,true);
+  view.setUint32(24,abuf.sampleRate,true); view.setUint32(28,abuf.sampleRate * numChan * 2,true);
+  view.setUint16(32,numChan*2,true); view.setUint16(34,16,true); writeString(36,'data'); view.setUint32(40,len*2,true);
+  let offset = 44;
+  const chans = []; for(let i=0;i<numChan;i++) chans.push(abuf.getChannelData(i));
+  for(let i=0;i<abuf.length;i++){
+    for(let ch=0;ch<numChan;ch++){
+      let s = Math.max(-1, Math.min(1, chans[ch][i]));
+      view.setInt16(offset, s<0? s*0x8000 : s*0x7FFF, true);
+      offset += 2;
+    }
+  }
+  return new Blob([view], {type:'audio/wav'});
+}
+
+// ---- Save processed button
+saveWav.onclick = async () => {
+  if(!rawAudioBuffer){ alert('Hakuna sauti (rekodi/upload)'); return; }
+  const options = {
+    pitch: parseFloat(pitch.value),
+    formant: parseFloat(formant.value),
+    reverb: fxReverb.checked,
+    distort: fxDist.checked,
+    robot: fxRobot.checked,
+    bandQ: 1
+  };
+  try{
+    const wav = await renderProcessedToWav(rawAudioBuffer, options);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(wav);
+    a.download = 'kavishe-processed-'+Date.now()+'.wav';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    log('Processed WAV downloaded');
+  }catch(e){ log('Render error: ' + e.message); alert('Render failed: ' + e.message); }
+};
+
+// ---- play preset btn (double: uses selected preset + UI overrides)
+function getCurrentPreset(){
+  const base = PRESETS[selectedPresetIndex] || PRESETS[0];
+  return {
+    name: base.label,
+    pitch: parseFloat(pitch.value) || base.pitch,
+    formant: parseFloat(formant.value) || base.formant,
+    reverb: fxReverb.checked || base.reverb,
+    distort: fxDist.checked || base.distort,
+    robot: fxRobot.checked || base.robot,
+    robotFreq: 30,
+    bandQ: 1
+  };
+}
+
+// create preset UI
+updatePresetUI();
+applyPresetToControls(PRESETS[0]);
+
+// create "Play Preset" when double-clicking selected preset area
+presetsDiv.addEventListener('dblclick', ()=> {
+  if(!rawAudioBuffer){ alert('Hakuna sauti (rekodi/upload)'); return; }
+  const preset = getCurrentPreset();
+  playWithPreset(rawAudioBuffer, preset);
+});
+
+// keyboard: space to play raw (quick)
+document.body.addEventListener('keyup', (e)=>{ if(e.code==='Space'){ if(playRaw.disabled===false) playRaw.click(); } });
+
+// ---- draw waveform
+function drawWave(buffer){
+  const ctx = wave.getContext('2d');
+  const w = wave.clientWidth, h = wave.clientHeight;
+  wave.width = w * devicePixelRatio; wave.height = h * devicePixelRatio;
+  ctx.clearRect(0,0,w,h);
+  ctx.scale(devicePixelRatio, devicePixelRatio);
+  ctx.fillStyle = '#00171b'; ctx.fillRect(0,0,w,h);
+  ctx.strokeStyle = '#55c1ff'; ctx.lineWidth = 1;
+  const data = buffer.getChannelData(0);
+  const step = Math.ceil(data.length / w);
+  ctx.beginPath();
+  for(let i=0;i<w;i++){
+    let sum=0;
+    for(let j=0;j<step;j++){
+      sum += Math.abs(data[i*step + j] || 0);
+    }
+    const v = sum/step;
+    const y = (1 - v) * (h/2);
+    if(i===0) ctx.moveTo(i,y); else ctx.lineTo(i,y);
+  }
+  ctx.stroke();
+}
+
+// ---- TTS
+speakBtn.onclick = ()=> {
+  const txt = ttsText.value.trim();
+  if(!txt){ alert('Andika maandishi kwanza'); return; }
+  const ut = new SpeechSynthesisUtterance(txt);
+  ut.lang = ttsLang.value || 'sw-TZ';
+  speechSynthesis.cancel();
+  speechSynthesis.speak(ut);
+  log('TTS spoken (no FX) - lang: ' + ut.lang);
+};
+
+// limited: speak + FX (best-effort message)
+speakFxBtn.onclick = ()=> {
+  alert('TTS + FX ni limit kwenye browser. Kawaida tunapendekeza kurekodi TTS au kutumia server-side TTS API kisha kupakia/kucheza hapa na FX.');
+  log('Requested TTS+FX (informational only)');
+};
+
+// ---- UI events to keep values in sync
+pitch.oninput = ()=> { pitchVal.textContent = parseFloat(pitch.value).toFixed(2) + 'x'; };
+formant.oninput = ()=> { formVal.textContent = parseFloat(formant.value).toFixed(1); };
+
+// ---- ready
+log('Voice Lab loaded. Double-click a preset to PLAY it with current audio as demo.\nTip: Press Start Recording, speak, Stop, then double-click chosen preset to hear effect.');
+</script>
+</body>
+</html>
